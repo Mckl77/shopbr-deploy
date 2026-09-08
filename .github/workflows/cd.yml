@@ -1,0 +1,141 @@
+# ====================================================================
+# Projet certification - ShopBR - CD du depot de DEPLOIEMENT
+# ====================================================================
+#
+# ROLE DE CE WORKFLOW (la partie "CD" de CI/CD) :
+# Il prend le code valide par la CI du depot shopbr-ia et l'amene
+# jusqu'en production, en deux etapes :
+#
+#   JOB 1 (build-and-push) : construire l'image Docker et la publier
+#     dans Amazon ECR (le registre prive d'images de ShopBR), taguee
+#     avec le SHA du commit (tracabilite : on sait exactement quelle
+#     version du code tourne en production).
+#
+#   JOB 2 (deploy) : appliquer les manifestes Kubernetes sur le
+#     cluster EKS et basculer les Deployments sur la nouvelle image.
+#     Le RollingUpdate configure dans k8s/deployment.yaml garantit
+#     zero interruption de service pendant la bascule.
+#
+# DECLENCHEURS :
+# - repository_dispatch "deploy" : envoye automatiquement par la CI
+#   du depot shopbr-ia quand lint + tests + build sont verts sur main.
+# - workflow_dispatch : declenchement MANUEL depuis l'onglet Actions
+#   (utile pour la demo video de la certification, ou pour redeployer
+#   une version precise).
+#
+# SECRETS A CONFIGURER (Settings > Secrets and variables > Actions) :
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY : identifiants IAM d'un
+#     utilisateur limite aux droits ECR push + EKS deploy (moindre
+#     privilege, cf politique de securite du projet).
+#   AWS_ACCOUNT_ID : numero de compte AWS (12 chiffres).
+# VARIABLES (Settings > Variables) :
+#   AWS_REGION   : sa-east-1 (Sao Paulo - donnees au Bresil, LGPD)
+#   ECR_REPO     : shopbr-api
+#   EKS_CLUSTER  : shopbr-cluster
+# ====================================================================
+
+name: CD - Build, push ECR et deploiement EKS
+
+on:
+  repository_dispatch:
+    types: [deploy]        # declenche par la CI de shopbr-ia
+  workflow_dispatch:       # declenchement manuel
+    inputs:
+      sha:
+        description: "SHA du commit de shopbr-ia a deployer (vide = main)"
+        required: false
+        default: ""
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'sa-east-1' }}
+  ECR_REPO: ${{ vars.ECR_REPO || 'shopbr-api' }}
+  EKS_CLUSTER: ${{ vars.EKS_CLUSTER || 'shopbr-cluster' }}
+  # Depot de code source (remplacer VOTRE_COMPTE)
+  SOURCE_REPO: ${{ github.event.client_payload.repo || 'VOTRE_COMPTE/shopbr-ia' }}
+  SOURCE_SHA: ${{ github.event.client_payload.sha || inputs.sha || 'main' }}
+
+jobs:
+
+  # ── JOB 1 : CONSTRUIRE ET PUBLIER L'IMAGE ───────────────────────
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Recuperer le code source (depot shopbr-ia)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_SHA }}
+          # token requis si shopbr-ia est prive :
+          token: ${{ secrets.DEPLOY_REPO_TOKEN || github.token }}
+
+      - name: Configurer les identifiants AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Se connecter a Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construire et publier l'image
+        id: meta
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          IMAGE="$REGISTRY/$ECR_REPO:$SHORT_SHA"
+          docker build -t "$IMAGE" -t "$REGISTRY/$ECR_REPO:latest" .
+          docker push "$IMAGE"
+          docker push "$REGISTRY/$ECR_REPO:latest"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Image publiee : $IMAGE"
+
+  # ── JOB 2 : DEPLOYER SUR KUBERNETES (EKS) ───────────────────────
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production   # permet d'exiger une approbation manuelle dans GitHub si souhaite
+    steps:
+      - name: Recuperer les manifestes (ce depot)
+        uses: actions/checkout@v4
+
+      - name: Configurer les identifiants AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Recuperer le kubeconfig du cluster EKS
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+
+      - name: Appliquer les manifestes Kubernetes
+        # service.yaml contient aussi Namespace, Ingress et HPA.
+        # kubectl apply est idempotent : ne change que ce qui differe.
+        run: |
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/deployment.yaml
+
+      - name: Basculer sur la nouvelle image (rolling update)
+        env:
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+        run: |
+          kubectl -n shopbr set image deployment/shopbr-api       shopbr-api=$IMAGE
+          kubectl -n shopbr set image deployment/shopbr-dashboard shopbr-dashboard=$IMAGE
+
+      - name: Attendre la fin du deploiement et verifier la sante
+        run: |
+          kubectl -n shopbr rollout status deployment/shopbr-api --timeout=300s
+          kubectl -n shopbr rollout status deployment/shopbr-dashboard --timeout=300s
+          kubectl -n shopbr get pods -o wide
+
+      - name: Rollback automatique en cas d'echec
+        if: failure()
+        run: |
+          echo "Echec du deploiement - retour a la version precedente"
+          kubectl -n shopbr rollout undo deployment/shopbr-api || true
+          kubectl -n shopbr rollout undo deployment/shopbr-dashboard || true
