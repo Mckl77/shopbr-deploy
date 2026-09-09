@@ -1,0 +1,194 @@
+# ====================================================================
+# Projet #7 - ShopBR - Services + Ingress + HPA (autoscaling)
+# ====================================================================
+#
+# Ce fichier complete deployment.yaml en definissant comment le trafic
+# REJOINT nos applications (Service, Ingress) et comment le nombre de
+# copies de l'API s'ADAPTE AUTOMATIQUEMENT a la charge (HPA).
+# ====================================================================
+
+# ── SERVICE 1 : EXPOSITION DE L'API ─────────────────────────────────
+#
+# QU'EST-CE QU'UN "SERVICE" KUBERNETES ?
+# Un Deployment cree plusieurs Pods (copies du conteneur), mais chaque
+# Pod a sa propre adresse IP interne, qui CHANGE a chaque redemarrage.
+# Un "Service" cree une adresse STABLE qui redirige automatiquement le
+# trafic vers n'importe laquelle des copies disponibles, sans que les
+# autres applications aient besoin de connaitre les adresses IP
+# changeantes des Pods individuels. C'est l'equivalent d'un standard
+# telephonique qui redirige toujours vers un conseiller disponible,
+# peu importe lequel.
+apiVersion: v1
+kind: Service
+metadata:
+  name: shopbr-api-service
+  namespace: shopbr
+spec:
+  # type: LoadBalancer = demande a AWS de creer automatiquement un
+  # equilibreur de charge externe (ELB), qui donne une adresse
+  # accessible depuis Internet et repartit le trafic entrant entre
+  # toutes les copies saines de notre API.
+  type: LoadBalancer
+  selector:
+    # Ce Service redirige le trafic vers tous les Pods portant
+    # l'etiquette app=shopbr-api (definie dans deployment.yaml).
+    app: shopbr-api
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80          # port expose vers l'exterieur (le port web standard)
+      targetPort: 8000  # port reel sur lequel l'API ecoute a l'interieur du conteneur
+
+---
+# ── SERVICE 2 : EXPOSITION DU DASHBOARD ─────────────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: shopbr-dashboard-service
+  namespace: shopbr
+spec:
+  # type: ClusterIP = contrairement a l'API, le dashboard n'est PAS
+  # expose directement sur Internet ici. Il n'est accessible que
+  # depuis l'INTERIEUR du cluster Kubernetes (ou via l'Ingress
+  # ci-dessous, qui gere l'acces externe de maniere plus controlee).
+  type: ClusterIP
+  selector:
+    app: shopbr-dashboard
+  ports:
+    - port: 8050
+      targetPort: 8050
+
+---
+# ── INGRESS : ROUTAGE PAR NOM DE DOMAINE ────────────────────────────
+#
+# QU'EST-CE QU'UN INGRESS ?
+# Si on avait plusieurs LoadBalancer (un par Service), cela couterait
+# cher et serait complexe a gerer. L'Ingress est un point d'entree
+# UNIQUE qui examine le nom de domaine demande (api.shopbr.com ou
+# dashboard.shopbr.com) et redirige vers le bon Service en fonction.
+# C'est un peu comme un standardiste qui lit l'etiquette d'un colis
+# pour savoir dans quel service de l'entreprise le faire suivre.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: shopbr-ingress
+  namespace: shopbr
+  annotations:
+    kubernetes.io/ingress.class: nginx   # on utilise le controleur Ingress NGINX, tres repandu
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    # cert-manager genere et renouvelle AUTOMATIQUEMENT les
+    # certificats SSL/HTTPS, sans intervention manuelle.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+    # Active le chiffrement HTTPS pour ces deux noms de domaine.
+    - hosts:
+        - api.shopbr.com
+        - dashboard.shopbr.com
+      secretName: shopbr-tls
+  rules:
+    # Regle 1 : tout le trafic vers api.shopbr.com va au Service de l'API
+    - host: api.shopbr.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shopbr-api-service
+                port:
+                  number: 80
+    # Regle 2 : tout le trafic vers dashboard.shopbr.com va au Service du dashboard
+    - host: dashboard.shopbr.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: shopbr-dashboard-service
+                port:
+                  number: 8050
+
+---
+# ── HPA : HORIZONTAL POD AUTOSCALER ─────────────────────────────────
+#
+# QU'EST-CE QUE L'AUTOSCALING ?
+# C'est la fonctionnalite qui repond directement a l'exigence de
+# l'enonce : "permettre une mise a l'echelle automatique". Plutot que
+# de toujours faire tourner un nombre FIXE de copies de l'API (ce qui
+# gaspillerait des ressources en period creuse, ou serait insuffisant
+# en pic de charge), le HPA surveille en permanence la consommation
+# CPU/memoire de nos Pods et ajuste automatiquement leur nombre.
+#
+# JUSTIFICATION METIER POUR SHOPBR :
+# Lors des periodes de soldes bresiliennes (Black Friday locale par
+# exemple), le nombre de commandes - et donc d'appels a l'API de
+# prediction - peut etre multiplie par plusieurs fois la normale. Sans
+# autoscaling, l'API deviendrait lente voire indisponible exactement
+# au moment ou elle est la plus utile.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: shopbr-api-hpa
+  namespace: shopbr
+spec:
+  scaleTargetRef:
+    # Indique a quel Deployment ce HPA s'applique : celui de l'API.
+    apiVersion: apps/v1
+    kind: Deployment
+    name: shopbr-api
+  minReplicas: 2   # ne descend jamais en dessous de 2 copies (haute disponibilite garantie)
+  maxReplicas: 10  # ne monte jamais au-dessus de 10 copies (protection contre un emballement incontrole et maitrise des couts)
+  metrics:
+    # Le HPA scale (ajoute des copies) si la consommation CPU MOYENNE
+    # de toutes les copies actuelles depasse 70% de ce qui a ete
+    # "reserve" (la valeur "requests.cpu" definie dans deployment.yaml).
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Meme logique pour la memoire, avec un seuil de 80%.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    # "behavior" affine la REACTIVITE de l'autoscaler, pour eviter
+    # des oscillations trop frequentes (ajouter puis retirer des
+    # copies en boucle, ce qui serait inefficace).
+    scaleUp:
+      # Avant d'ajouter des copies, le HPA attend 60 secondes de
+      # charge elevee confirmee (pas juste un pic instantane).
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2          # ajoute au maximum 2 copies a la fois
+          periodSeconds: 60  # par tranche de 60 secondes
+    scaleDown:
+      # Pour RETIRER des copies, on est volontairement plus prudent :
+      # on attend 5 minutes de charge faible confirmee avant de
+      # reduire, pour eviter de retirer une copie puis devoir la
+      # rajouter immediatement si la charge remonte.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1           # retire au maximum 1 copie a la fois
+          periodSeconds: 120
+
+---
+# ── NAMESPACE ────────────────────────────────────────────────────────
+# Un namespace est un espace de noms qui isole logiquement nos
+# ressources (Deployments, Services...) de celles des autres projets
+# qui pourraient tourner sur le meme cluster Kubernetes partage.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: shopbr
+  labels:
+    project: projet7
+    env: production
