@@ -1,85 +1,101 @@
-# ShopBR — Pipeline de déploiement CI/CD (dépôt n°2)
+# ShopBR — Déploiement (dépôt n°2 : CI/CD)
 
-Infrastructure as Code et déploiement continu de la solution ShopBR
-sur AWS (ECR + EKS).
+Infrastructure et déploiement continu de la solution ShopBR sur AWS
+(ECR pour les images, EKS pour Kubernetes).
 
-> Projet de certification **Architecte en Intelligence Artificielle**.
-> Ce dépôt contient le **pipeline de déploiement** (Bloc 4, exigence
-> "deux dépôts GitHub distincts"). Le code de la solution vit dans le
-> dépôt **shopbr-ia**.
+> Projet de certification **Architecte en Intelligence Artificielle**
+> (Mastère 2, Fonderie de l'Image). Ce dépôt contient le **pipeline de
+> déploiement**. Le code de la solution vit dans le dépôt
+> **[shopbr-ia](https://github.com/Mckl77/shopbr-ia)**.
 
 ---
 
-## Pourquoi deux dépôts séparés ?
+## Pourquoi deux dépôts séparés
 
-Séparer le code applicatif du code de déploiement est une bonne
-pratique (et une exigence de l'énoncé) :
+- **Moindre privilège** : seuls les identifiants de ce dépôt donnent
+  accès à la production. Un développeur peut modifier le code de la
+  solution sans jamais pouvoir toucher aux serveurs.
+- **Traçabilité** : chaque déploiement référence le commit exact
+  déployé, donc on sait toujours quelle version tourne.
+- **Rythmes différents** : le code applicatif change tous les jours,
+  l'infrastructure beaucoup plus rarement.
 
-- **Moindre privilège** : seuls les identifiants AWS de CE dépôt
-  peuvent toucher la production ; le dépôt de dev n'a aucun secret AWS.
-- **Traçabilité** : chaque déploiement référence le SHA exact du
-  commit déployé — on sait toujours quelle version tourne.
-- **Cycle de vie distinct** : les manifestes Kubernetes évoluent
-  moins vite que le code, et sont revus par d'autres personnes (ops).
+---
 
 ## Arborescence
 
 ```
 shopbr-deploy/
 ├── k8s/
-│   ├── deployment.yaml   Deployments API (2 replicas, probes) + dashboard
-│   └── service.yaml      Namespace, Services, Ingress (TLS), HPA 2→10 pods
-├── scripts/deploy.sh     déploiement manuel (secours / démo)
-└── .github/workflows/cd.yml   CD : build+push ECR → deploy EKS → rollback auto
+│   ├── deployment.yaml   Deployments de l'API (2 copies, sondes de santé) et du dashboard
+│   └── service.yaml      Namespace, Services, Ingress (TLS) et autoscaling 2 → 10 copies
+├── scripts/
+│   └── deploy.sh         déploiement manuel, en secours ou pour une démonstration
+└── .github/workflows/cd.yml   construction de l'image, publication ECR, déploiement EKS
 ```
+
+---
 
 ## La chaîne complète
 
 ```
-dépôt shopbr-ia                        dépôt shopbr-deploy (celui-ci)
-────────────────                       ──────────────────────────────
+dépôt shopbr-ia                        dépôt shopbr-deploy (ce dépôt)
 push sur main
-  └─ CI : lint → tests → build ✓
-       └─ repository_dispatch ───────→ CD déclenché automatiquement
-                                         ├─ JOB build-and-push
-                                         │    checkout shopbr-ia@SHA
-                                         │    docker build
-                                         │    push ECR (tag = SHA court)
-                                         └─ JOB deploy
-                                              kubectl apply k8s/
-                                              set image (rolling update, 0 coupure)
-                                              rollout status (vérification santé)
-                                              rollback automatique si échec
+  └─ CI : lint → 15 tests ✓
+       └─ signal automatique ────────→ déploiement déclenché
+                                         ├─ récupération du code au commit exact
+                                         ├─ construction de l'image Docker
+                                         ├─ publication sur Amazon ECR
+                                         ├─ déploiement sur Kubernetes (mise à jour progressive)
+                                         └─ retour arrière automatique en cas d'échec
 ```
 
-L'**autoscaling** (HPA 2→10 pods, CPU 70 %) est dimensionné pour les
-pics mesurés dans les données : ×7 au Black Friday (1 176 commandes le
-24/11/2017 contre 160/jour en moyenne).
+La construction de l'image est faite ici, pas dans la CI du dépôt de
+développement : celle-ci valide le code, celui-ci construit et déploie.
 
-## Configuration requise (une seule fois)
+L'**autoscaling** (de 2 à 10 copies, déclenché à 70 % d'utilisation du
+processeur) est dimensionné sur les pics mesurés dans les données :
+1 176 commandes le jour du Black Friday, contre 160 par jour en
+moyenne, soit sept fois la charge habituelle.
+
+---
+
+## Configuration requise
 
 Dans **Settings → Secrets and variables → Actions** de ce dépôt :
 
 | Type | Nom | Valeur |
 |---|---|---|
-| Secret | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | utilisateur IAM limité à ECR push + EKS deploy |
-| Secret | `AWS_ACCOUNT_ID` | compte AWS (12 chiffres) |
-| Secret | `DEPLOY_REPO_TOKEN` | PAT si shopbr-ia est privé |
-| Variable | `AWS_REGION` | `sa-east-1` (São Paulo — LGPD) |
+| Secret | `AWS_ACCESS_KEY_ID` et `AWS_SECRET_ACCESS_KEY` | utilisateur IAM limité à la publication ECR et au déploiement EKS |
+| Secret | `AWS_ACCOUNT_ID` | numéro de compte AWS |
+| Variable | `AWS_REGION` | `sa-east-1` (São Paulo, pour rester conforme à la LGPD) |
 | Variable | `ECR_REPO` | `shopbr-api` |
 | Variable | `EKS_CLUSTER` | `shopbr-cluster` |
 
-Puis remplacer `VOTRE_COMPTE` dans `cd.yml`, et `YOUR_AWS_ACCOUNT`
-dans `k8s/deployment.yaml`.
+Il reste ensuite à remplacer `YOUR_AWS_ACCOUNT` dans
+`k8s/deployment.yaml` par le numéro de compte.
 
-## Déclenchement manuel (démo certification)
+---
 
-Onglet **Actions → CD → Run workflow** : idéal pour la capture vidéo
-exigée par le Bloc 4 (on voit le build, le push ECR, le rolling update
-et la vérification `rollout status` en direct).
+## Déclenchement manuel
 
-Ou en secours, sans GitHub Actions :
+Onglet **Actions → CD → Run workflow**, utile pour une démonstration :
+on voit la construction, la publication et la mise à jour progressive
+se dérouler en direct.
+
+En secours, sans GitHub Actions :
 
 ```bash
 ./scripts/deploy.sh <SHA_ou_main>
 ```
+
+---
+
+## Limite assumée
+
+Aucun cluster Kubernetes n'a été provisionné : le déploiement s'arrête
+à l'authentification AWS. C'est un choix cohérent avec l'arbitrage de
+coûts du projet, un cluster EKS de démonstration revenant à plusieurs
+dizaines de dollars par mois sans rien démontrer de plus. Toute la
+chaîne en amont, jusqu'au déclenchement automatique, est fonctionnelle
+et vérifiable dans l'onglet Actions.
