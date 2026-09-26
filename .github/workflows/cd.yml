@@ -50,8 +50,8 @@ env:
   AWS_REGION: ${{ vars.AWS_REGION || 'sa-east-1' }}
   ECR_REPO: ${{ vars.ECR_REPO || 'shopbr-api' }}
   EKS_CLUSTER: ${{ vars.EKS_CLUSTER || 'shopbr-cluster' }}
-  # Depot de code source (remplacer VOTRE_COMPTE)
-  SOURCE_REPO: ${{ github.event.client_payload.repo || 'VOTRE_COMPTE/shopbr-ia' }}
+  # Depot de code source
+  SOURCE_REPO: ${{ github.event.client_payload.repo || 'Mckl77/shopbr-ia' }}
   SOURCE_SHA: ${{ github.event.client_payload.sha || inputs.sha || 'main' }}
 
 jobs:
